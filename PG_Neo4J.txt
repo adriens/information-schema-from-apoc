@@ -1,0 +1,213 @@
+######################################################################"
+cypher CALL apoc.load.driver("org.postgresql.Driver");
+
+MATCH (n)
+DETACH DELETE n;
+
+-- Create catalogs
+CALL apoc.load.jdbc('myDB','select distinct table_catalog as name from information_schema.tables') YIELD row
+CREATE (n:Catalog {name:row.name});
+
+-- Create schemas
+CALL apoc.load.jdbc('myDB','SELECT schema_name, schema_owner, catalog_name FROM information_schema.schemata') YIELD row
+CREATE (n:Schema {name:row.schema_name, owner:row.schema_owner, catalog_name:row.catalog_name});
+
+-- link Schema to catalog
+MATCH (s:Schema),(c:Catalog)
+WHERE s.catalog_name = c.name
+CREATE (s)-[r:BELONGS_TO_CATALOG]->(c)
+RETURN type(r);
+
+-- Create tables
+CALL apoc.load.jdbc('myDB','select table_name, table_catalog, table_schema, table_type, is_insertable_into, is_typed from information_schema.tables where table_type <> \'VIEW\'') YIELD row
+CREATE (n:Table {name:row.table_name, catalog:row.table_catalog, schema:row.table_schema, type:row.table_type});
+
+-- link tables to schemas
+MATCH (t:Table),(s:Schema)
+WHERE t.schema = s.name
+CREATE (t)-[r:BELONGS_TO_SCHEMA]->(s)
+RETURN type(r);
+
+-- Create views
+CALL apoc.load.jdbc('myDB','SELECT table_name, table_catalog, table_schema, view_definition FROM information_schema.views') YIELD row
+CREATE (n:View {name:row.table_name, catalog:row.table_catalog, schema:row.table_schema, definition:row.view_definition});
+
+-- link views to schema
+MATCH (v:View),(s:Schema)
+WHERE v.schema = s.name
+CREATE (v)-[r:BELONGS_TO_SCHEMA]->(s)
+RETURN type(r);
+
+-- Create columns
+CALL apoc.load.jdbc('myDB','SELECT column_name, table_catalog, table_schema, table_name, ordinal_position, is_nullable, data_type, character_maximum_length, 
+character_octet_length, numeric_precision, udt_name, dtd_identifier, is_identity, is_generated, is_updatable
+FROM information_schema.columns') YIELD row
+CREATE (n:Column {name:row.column_name, catalog:row.table_catalog, schema:row.table_schema, table_name:row.table_name, ordinal_position:row.ordinal_position, is_nullable:row.is_nullable,
+data_type:row.data_type, character_maximum_length:row.character_maximum_length, character_octet_length:row.character_octet_length, numeric_precision:row.numeric_precision, udt_name:row.udt_name,
+dtd_identifier:row.dtd_identifier, is_identity:row.is_identity, is_generated:row.is_generated, is_updatable:row.is_updatable });
+
+-- Link columns to tables
+MATCH (c:Column),(t:Table)
+WHERE c.table_name = t.name and c.schema = t.schema
+CREATE (c)-[r:COLUMN_OF]->(t)
+RETURN type(r);
+
+-- Link columns to views
+MATCH (c:Column),(v:View)
+WHERE c.table_name = v.name and c.schema = v.schema
+CREATE (c)-[r:COLUMN_OF]->(v)
+RETURN type(r);
+
+-- Create Check Constraints and attach them to columns
+CALL apoc.load.jdbc('myDB','SELECT cc.constraint_name as name, ccu.table_catalog as catalog, ccu.table_schema as schema, ccu.table_name, ccu.column_name,
+cc.check_clause
+FROM information_schema.constraint_column_usage ccu, information_schema.check_constraints cc 
+where
+ccu.constraint_catalog = cc.constraint_catalog and
+ccu.constraint_schema = cc.constraint_schema and
+ccu.constraint_name = cc.constraint_name') YIELD row
+MERGE (c:Column {name:row.column_name, catalog:row.catalog, schema:row.schema, table_name:row.table_name})
+MERGE (k:CheckConstraint {name:row.name, catalog:row.catalog, schema:row.schema, table_name:row.table_name, check_clause:row.check_clause})
+CREATE (c)-[r:CHECKED_BY]->(k);
+
+
+
+-- Create NotNull constraintes
+CALL apoc.load.jdbc('myDB','SELECT c.table_catalog, c.table_schema, c.table_name, c.column_name
+FROM information_schema.columns c
+where c.is_nullable = \'NO\'') YIELD row
+MERGE (c:Column {name:row.column_name, catalog:row.table_catalog, schema:row.table_schema, table_name:row.table_name})
+MERGE (k:NotNullConstraint {name:row.table_schema + '-' + row.table_name + '-' + row.column_name + ' IS NOT NULL', catalog:row.table_catalog, schema:row.table_schema, table_name:row.table_name, column_name:row.column_name})
+CREATE (c)-[r:CHECKED_BY]->(k);
+
+-- Create unique constraints
+CALL apoc.load.jdbc('myDB','select TC.Constraint_Name,
+CC.Column_Name,
+cc.table_catalog,
+cc.table_schema,
+cc.table_name
+from information_schema.table_constraints TC
+inner join information_schema.constraint_column_usage CC on TC.Constraint_Name = CC.Constraint_Name
+where TC.constraint_type = \'UNIQUE\'
+order by TC.Constraint_Name') YIELD row
+MERGE (c:Column {name:row.column_name, catalog:row.table_catalog, schema:row.table_schema, table_name:row.table_name})
+MERGE (k:UniqueConstraint {name:row.constraint_name, catalog:row.table_catalog, schema:row.table_schema, table_name:row.table_name})
+CREATE (c)-[r:CHECKED_BY]->(k);
+
+-- Create Primary Keys
+CALL apoc.load.jdbc('myDB','select TC.Constraint_Name,
+CC.Column_Name,
+cc.table_catalog,
+cc.table_schema,
+cc.table_name
+from information_schema.table_constraints TC
+inner join information_schema.constraint_column_usage CC on TC.Constraint_Name = CC.Constraint_Name
+where TC.constraint_type = \'PRIMARY KEY\'
+order by TC.Constraint_Name') YIELD row
+MERGE (c:Column {name:row.column_name, catalog:row.table_catalog, schema:row.table_schema, table_name:row.table_name})
+MERGE (k:PrimaryKey {name:row.constraint_name, catalog:row.table_catalog, schema:row.table_schema, table_name:row.table_name})
+CREATE (c)-[r:REFERENCED_BY_PK]->(k);
+
+-- Create FKs
+CALL apoc.load.jdbc('myDB','SELECT
+	tc.table_catalog,
+    tc.table_schema, 
+    tc.constraint_name, 
+    tc.table_name, 
+    kcu.column_name, 
+    ccu.table_schema AS foreign_table_catalog,
+	ccu.table_schema AS foreign_table_schema,
+    ccu.table_name AS foreign_table_name,
+    ccu.column_name AS foreign_column_name 
+FROM 
+    information_schema.table_constraints AS tc 
+    JOIN information_schema.key_column_usage AS kcu
+      ON tc.constraint_name = kcu.constraint_name
+      AND tc.table_schema = kcu.table_schema
+    JOIN information_schema.constraint_column_usage AS ccu
+      ON ccu.constraint_name = tc.constraint_name
+      AND ccu.table_schema = tc.table_schema
+WHERE constraint_type = \'FOREIGN KEY\'') YIELD row
+MERGE (c:Column {name:row.column_name, catalog:row.table_catalog, schema:row.table_schema, table_name:row.table_name})
+MERGE (k:ForeignKey {name:row.constraint_name, catalog:row.table_catalog, schema:row.table_schema, table_name:row.table_name})
+CREATE (c)-[r:REFERENCED_BY_FK]->(k);
+
+
+-- 
+CALL apoc.load.jdbc('myDB','SELECT
+	tc.table_catalog,
+    tc.table_schema, 
+    tc.constraint_name, 
+    tc.table_name, 
+    kcu.column_name, 
+    ccu.table_catalog AS foreign_table_catalog,
+	ccu.table_schema AS foreign_table_schema,
+    ccu.table_name AS foreign_table_name,
+    ccu.column_name AS foreign_column_name 
+FROM 
+    information_schema.table_constraints AS tc 
+    JOIN information_schema.key_column_usage AS kcu
+      ON tc.constraint_name = kcu.constraint_name
+      AND tc.table_schema = kcu.table_schema
+    JOIN information_schema.constraint_column_usage AS ccu
+      ON ccu.constraint_name = tc.constraint_name
+      AND ccu.table_schema = tc.table_schema
+WHERE constraint_type = \'FOREIGN KEY\'') YIELD row
+MERGE (c:Column {name:row.foreign_column_name, catalog:row.foreign_table_catalog, schema:row.foreign_table_schema, table_name:row.foreign_table_name})
+MERGE (k:ForeignKey {name:row.constraint_name, catalog:row.table_catalog, schema:row.table_schema, table_name:row.table_name})
+CREATE (k)-[r:REFERENCES]->(c);
+
+-- Table-REFERENCES->Table
+CALL apoc.load.jdbc('myDB','SELECT
+	tc.table_catalog,
+    tc.table_schema, 
+    tc.constraint_name, 
+    tc.table_name, 
+    kcu.column_name, 
+    ccu.table_catalog AS foreign_table_catalog,
+	ccu.table_schema AS foreign_table_schema,
+    ccu.table_name AS foreign_table_name,
+    ccu.column_name AS foreign_column_name 
+FROM 
+    information_schema.table_constraints AS tc 
+    JOIN information_schema.key_column_usage AS kcu
+      ON tc.constraint_name = kcu.constraint_name
+      AND tc.table_schema = kcu.table_schema
+    JOIN information_schema.constraint_column_usage AS ccu
+      ON ccu.constraint_name = tc.constraint_name
+      AND ccu.table_schema = tc.table_schema
+WHERE constraint_type = \'FOREIGN KEY\'') YIELD row
+MERGE (t1:Table {name:row.table_name, catalog:row.table_catalog, schema:row.table_schema})
+MERGE (t2:Table {name:row.foreign_table_name, catalog:row.foreign_table_catalog, schema:row.foreign_table_schema})
+CREATE (t1)-[r:REFERENCES]->(t2);
+
+-- triggers
+CALL apoc.load.jdbc('myDB','SELECT trigger_name, trigger_catalog, trigger_schema, event_manipulation,
+event_object_catalog, event_object_schema, event_object_table
+FROM information_schema.triggers') YIELD row
+CREATE (n:Trigger {name:row.trigger_name, catalog:row.trigger_catalog, schema:row.trigger_schema, event_manipulation:row.event_manipulation,
+event_object_catalog:row.event_object_catalog, event_object_schema:row.event_object_schema, event_object_table:row.event_object_table});
+
+-- link trigger to tables
+MATCH (g:Trigger),(t:Table)
+WHERE 
+	g.event_object_catalog = t.catalog and
+	g.event_object_schema = t.schema and
+	g.event_object_table = t.name 
+CREATE (t)-[r:FIRES_TRIGGER{event:g.event_manipulation}]->(g)
+RETURN type(r);
+
+
+-- sequences
+-- Create tables
+CALL apoc.load.jdbc('myDB','SELECT sequence_name, sequence_catalog, sequence_schema
+FROM information_schema.sequences') YIELD row
+CREATE (n:Sequence {name:row.sequence_name, catalog:row.sequence_catalog, schema:row.sequence_schema});
+
+-- link Sequence to schema
+MATCH (q:Sequence),(s:Schema)
+WHERE 
+	q.catalog = s.catalog_name and
+	q.schema = s.name
+CREATE (q)-[r:BELONGS_TO_SCHEMA]->(s)
+RETURN type(r);
